@@ -1,0 +1,25 @@
+step after instalation
+
+python3 -m venv venv
+
+source venv/bin/activate
+
+pip freeze > requirements.txt
+
+pip install tenacity
+
+git clone https://github.com/urllib3/urllib3.git
+cd urllib3
+pip install .
+
+pip install certify
+
+pip install requests
+
+pip install beautifulsoup4
+
+pip install -r requirements.txt
+
+pip install --upgrade charset-normalizer==3.3.2
+
+pip install --upgrade chardet==5.2.0

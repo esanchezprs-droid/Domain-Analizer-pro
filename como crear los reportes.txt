@@ -1,0 +1,11 @@
+# Solo reporte TXT (por defecto)
+python domain_analyzer_pro.py ejemplo.com
+
+# Reporte TXT y JSON
+python domain_analyzer_pro.py ejemplo.com --format all
+
+# Solo PDF
+python domain_analyzer_pro.py ejemplo.com --format pdf
+
+# Modo verbose
+python domain_analyzer_pro.py ejemplo.com -v --format all
