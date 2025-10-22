@@ -1,0 +1,15 @@
+Instalar localmente
+
+Desde la carpeta raíz (domain-analyzer-pro/):
+
+pip install .
+
+
+Luego prueba:
+
+domain-analyzer google.com --pdf
+
+
+O:
+
+python -m domain_analyzer_pro google.com

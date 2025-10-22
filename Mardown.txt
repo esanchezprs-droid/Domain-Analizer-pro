@@ -1,0 +1,11 @@
+domain-analyzer-pro/
+│
+├── domain_analyzer_pro/
+│   ├── __init__.py
+│   ├── __main__.py
+│   └── analyzer.py
+│
+├── pyproject.toml
+├── setup.cfg
+├── README.md
+└── LICENSE

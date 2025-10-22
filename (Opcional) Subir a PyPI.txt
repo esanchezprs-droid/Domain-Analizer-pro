@@ -1,0 +1,15 @@
+(Opcional) Subir a PyPI
+
+Instala herramientas de empaquetado:
+
+pip install build twine
+
+
+Crea los archivos de distribución:
+
+python -m build
+
+
+Sube a PyPI:
+
+twine upload dist/*
