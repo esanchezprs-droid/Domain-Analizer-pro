@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Domain Analyzer Pro v2.3 (Stable Release)
+Domain Analyzer Pro v2.3 (Stable Release) - CORREGIDO
 🔍 Comprehensive domain analysis: WHOIS, DNS, SSL, OWASP Top 10 Vulnerabilities, IP Geolocation, Subdomain Enumeration, PDF Report
 
 Author: BlueQuantum Security
@@ -16,8 +16,9 @@ import ssl
 import sys
 import subprocess
 import shutil
+import json
 import urllib3
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote, urljoin
 
 import requests
@@ -91,16 +92,30 @@ def parsear_whois_api(data):
     if not data or "domain" not in data:
         logger.warning("No valid WHOIS data received")
         return None
+    
+    # Manejar diferentes estructuras de respuesta de WHOIS
+    registrar_info = data.get("registrar", {})
+    if isinstance(registrar_info, str):
+        registrar_name = registrar_info
+    else:
+        registrar_name = registrar_info.get("name", "N/A")
+    
+    registrant_info = data.get("registrant", {})
+    if isinstance(registrant_info, str):
+        registrant_name = registrant_info
+    else:
+        registrant_name = registrant_info.get("name", "Privado")
+    
     info = {
         "Dominio": data.get("domain", "N/A"),
         "Estado": data.get("status", "N/A"),
-        "Creado": data.get("created_at", "N/A"),
+        "Creado": data.get("created_at", data.get("creation_date", "N/A")),
         "Expira": data.get("expires_at", data.get("expiration_date", "N/A")),
-        "Registrar": data.get("registrar", {}).get("name", "N/A"),
+        "Registrar": registrar_name,
         "Servidores DNS": ", ".join(data.get("nameservers", [])),
-        "Registrante": data.get("registrant", {}).get("name", "Privado"),
-        "Email": data.get("registrant", {}).get("email", "Privado"),
-        "País": data.get("registrant", {}).get("country", "N/A"),
+        "Registrante": registrant_name,
+        "Email": registrant_info.get("email", "Privado") if isinstance(registrant_info, dict) else "Privado",
+        "País": registrant_info.get("country", "N/A") if isinstance(registrant_info, dict) else "N/A",
     }
     logger.info(f"Parsed WHOIS data: {info}")
     return info
@@ -137,34 +152,56 @@ def obtener_ssl(dominio):
     logger.info(f"Analyzing SSL certificate for {dominio}")
     try:
         context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        
         with socket.create_connection((dominio, 443), timeout=DEFAULT_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=dominio) as ssock:
                 cert = ssock.getpeercert()
+                
         if not cert:
             logger.warning(f"No SSL certificate found for {dominio}")
-            return None
+            return {"Error": "No certificate found"}
 
+        # Parse certificate dates safely
         try:
             not_before = datetime.strptime(cert["notBefore"], "%b %d %H:%M:%S %Y %Z")
             not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-        except Exception:
-            logger.warning(f"Unexpected date format in SSL cert for {dominio}")
-            not_before = not_after = datetime.utcnow()
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Error parsing SSL certificate dates: {e}")
+            # Fallback to current time if parsing fails
+            not_before = not_after = datetime.now(timezone.utc)
 
-        ahora = datetime.utcnow()
+        # Use timezone-aware datetime (CORRECCIÓN DEL WARNING)
+        ahora = datetime.now(timezone.utc)
+        # Make dates timezone-aware if they aren't
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        if not_after.tzinfo is None:
+            not_after = not_after.replace(tzinfo=timezone.utc)
+            
         dias_restantes = (not_after - ahora).days
         estado = "✅ Válido" if ahora < not_after else "❌ Expirado"
-        if dias_restantes < 30:
+        if 0 < dias_restantes < 30:
             estado += " ⚠️ Expira pronto"
 
+        # Parse subject and issuer safely
+        def parse_name_components(components):
+            if not components:
+                return "N/A"
+            try:
+                return ", ".join([f"{k}: {v}" for item in components for k, v in item])
+            except Exception:
+                return str(components)
+
         info = {
-            "Sujeto": ", ".join(f"{k}: {v}" for k, v in cert.get("subject", [])),
-            "Emisor": ", ".join(f"{k}: {v}" for k, v in cert.get("issuer", [])),
+            "Sujeto": parse_name_components(cert.get("subject", [])),
+            "Emisor": parse_name_components(cert.get("issuer", [])),
             "Válido Desde": not_before.strftime("%Y-%m-%d"),
             "Válido Hasta": not_after.strftime("%Y-%m-%d"),
             "Días Restantes": dias_restantes,
             "Estado": estado,
-            "Nombres Alternativos": ", ".join(name[1] for name in cert.get("subjectAltName", [])) if "subjectAltName" in cert else "N/A",
+            "Nombres Alternativos": ", ".join([name[1] for name in cert.get("subjectAltName", [])]) if cert.get("subjectAltName") else "N/A",
         }
         return info
     except Exception as e:
@@ -218,8 +255,8 @@ def analizar_vulnerabilidades(dominio, verbose=False):
             puntuacion -= 15
 
         # Cookies
-        cookies_secure = all(c.secure for c in response.cookies)
-        if not cookies_secure:
+        cookies_secure = all(hasattr(c, 'secure') and c.secure for c in response.cookies)
+        if response.cookies and not cookies_secure:
             vulnerabilidades.append("❌ Cookies sin Secure flag")
             puntuacion -= 10
 
@@ -243,13 +280,113 @@ def analizar_vulnerabilidades(dominio, verbose=False):
         ] if puntuacion < 80 else []
     }
 
+def generar_reporte_txt(dominio, results):
+    """Generate comprehensive text report."""
+    filename = f"report_{dominio.replace('.', '_')}.txt"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write(f"DOMAIN ANALYZER PRO - REPORTE COMPLETO\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Dominio: {dominio}\n")
+        f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
+        
+        # Información DNS
+        f.write("1. INFORMACIÓN DNS\n")
+        f.write("-" * 40 + "\n")
+        if results["dns"]["ips"]:
+            f.write(f"IPs resueltas: {', '.join(results['dns']['ips'])}\n")
+        else:
+            f.write("❌ No se pudieron resolver las IPs\n")
+        f.write("\n")
+        
+        # Subdominios
+        f.write("2. SUBDOMINIOS ANALIZADOS\n")
+        f.write("-" * 40 + "\n")
+        for sub in results["subdomains"]:
+            f.write(f"{sub['status']} {sub['subdomain']}")
+            if sub["ips"]:
+                f.write(f" → {', '.join(sub['ips'])}")
+            f.write("\n")
+        f.write("\n")
+        
+        # WHOIS
+        f.write("3. INFORMACIÓN WHOIS\n")
+        f.write("-" * 40 + "\n")
+        if results["whois"]:
+            for key, value in results["whois"].items():
+                f.write(f"{key}: {value}\n")
+        else:
+            f.write("❌ No se pudo obtener información WHOIS\n")
+        f.write("\n")
+        
+        # SSL
+        f.write("4. CERTIFICADO SSL\n")
+        f.write("-" * 40 + "\n")
+        if results["ssl"] and "Error" not in results["ssl"]:
+            for key, value in results["ssl"].items():
+                f.write(f"{key}: {value}\n")
+        else:
+            f.write("❌ No se pudo analizar el certificado SSL\n")
+        f.write("\n")
+        
+        # Geolocalización
+        f.write("5. GEOLOCALIZACIÓN\n")
+        f.write("-" * 40 + "\n")
+        if results["geolocation"]:
+            for ip, geo_data in results["geolocation"].items():
+                if geo_data:
+                    for key, value in geo_data.items():
+                        f.write(f"{key}: {value}\n")
+        else:
+            f.write("❌ No se pudo obtener geolocalización\n")
+        f.write("\n")
+        
+        # Vulnerabilidades
+        f.write("6. ANÁLISIS DE VULNERABILIDADES\n")
+        f.write("-" * 40 + "\n")
+        vuln = results["vulnerabilities"]
+        f.write(f"PUNTUACIÓN DE SEGURIDAD: {vuln['puntuacion']}/100\n\n")
+        
+        if vuln["vulnerabilidades"]:
+            f.write("VULNERABILIDADES ENCONTRADAS:\n")
+            for v in vuln["vulnerabilidades"]:
+                f.write(f"• {v}\n")
+        else:
+            f.write("✅ No se encontraron vulnerabilidades críticas\n")
+        
+        if vuln["recomendaciones"]:
+            f.write("\nRECOMENDACIONES:\n")
+            for r in vuln["recomendaciones"]:
+                f.write(f"• {r}\n")
+    
+    print(f"✅ Reporte de texto generado: {filename}")
+    return filename
+
+def generar_reporte_json(dominio, results):
+    """Generate JSON report for programmatic access."""
+    filename = f"report_{dominio.replace('.', '_')}.json"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump({
+            "dominio": dominio,
+            "fecha_analisis": datetime.now().isoformat(),
+            "resultados": results
+        }, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ Reporte JSON generado: {filename}")
+    return filename
+
 def generar_reporte_pdf(dominio, results):
     """Generate PDF report using LaTeX."""
     if not shutil.which("pdflatex"):
         print("⚠️ pdflatex no instalado. Solo se generará el archivo .tex")
-        return
+        return None
 
     logger.info(f"Generating PDF for {dominio}")
+    
+    # Construir contenido del reporte
     tex_content = rf"""
 \documentclass[a4paper,12pt]{{article}}
 \usepackage[utf8]{{inputenc}}
@@ -263,14 +400,32 @@ def generar_reporte_pdf(dominio, results):
 \date{{Generado el {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}}
 \maketitle
 
-\section*{{Resumen DNS}}
-IPs: {", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "Ninguna"}
+\section{{Resumen del Análisis}}
+\textbf{{Dominio:}} {dominio} \\
+\textbf{{Fecha:}} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} \\
 
-\section*{{Vulnerabilidades}}
-Puntuación: {results["vulnerabilities"]["puntuacion"]}/100
-\begin{{itemize}}
+\section{{Información DNS}}
+IPs Resueltas: {", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "No encontradas"} \\
+
+\section{{Subdominios}}
+\begin{{longtable}}{{l l p{{6cm}}}}
+\textbf{{Subdominio}} & \textbf{{Estado}} & \textbf{{IPs}} \\
+\midrule
+"""
+    # Agregar subdominios
+    for sub in results["subdomains"]:
+        tex_content += f"{sub['subdomain']} & {sub['status']} & {', '.join(sub['ips']) if sub['ips'] else 'N/A'} \\\\ \n"
+
+    tex_content += r"""
+\end{longtable}
+
+\section{Vulnerabilidades}
+\textbf{Puntuación de Seguridad:} """ + str(results["vulnerabilities"]["puntuacion"]) + r"""/100
+
+\begin{itemize}
 """ + "\n".join([f"\\item {v}" for v in results["vulnerabilities"]["vulnerabilidades"]]) + r"""
 \end{itemize}
+
 \end{document}
 """
 
@@ -279,12 +434,16 @@ Puntuación: {results["vulnerabilities"]["puntuacion"]}/100
         f.write(tex_content)
 
     try:
-        subprocess.run(["pdflatex", tex_file], check=True, capture_output=True)
-        print(f"✅ PDF generado: report_{dominio.replace('.', '_')}.pdf")
-    except subprocess.CalledProcessError:
-        print(f"❌ Error al compilar {tex_file}")
+        subprocess.run(["pdflatex", "-interaction=nonstopmode", tex_file], 
+                      check=True, capture_output=True)
+        pdf_file = f"report_{dominio.replace('.', '_')}.pdf"
+        print(f"✅ PDF generado: {pdf_file}")
+        return pdf_file
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error al compilar PDF: {e}")
+        return None
 
-def main(dominio, verbose=False, generate_pdf=False):
+def main(dominio, verbose=False, generate_pdf=False, output_format="txt"):
     if verbose:
         logger.setLevel(logging.DEBUG)
 
@@ -292,7 +451,9 @@ def main(dominio, verbose=False, generate_pdf=False):
         print(f"❌ '{dominio}' no es un dominio válido")
         return
 
-    print("🔍 Análisis completo del dominio:", dominio)
+    print(f"🔍 Análisis completo del dominio: {dominio}")
+    
+    # Realizar análisis
     results = {
         "dns": {"ips": obtener_ip_socket(dominio)},
         "subdomains": analizar_subdominios(dominio),
@@ -302,22 +463,47 @@ def main(dominio, verbose=False, generate_pdf=False):
         "geolocation": {}
     }
 
+    # Geolocalización para todas las IPs encontradas
+    all_ips = set()
     if results["dns"]["ips"]:
-        results["geolocation"][dominio] = geolocalizar_ip(results["dns"]["ips"][0])
+        all_ips.update(results["dns"]["ips"])
+    
+    for sub in results["subdomains"]:
+        if sub["ips"]:
+            all_ips.update(sub["ips"])
+    
+    for ip in all_ips:
+        geo_data = geolocalizar_ip(ip)
+        if geo_data:
+            results["geolocation"][ip] = geo_data
 
-    if generate_pdf:
-        generar_reporte_pdf(dominio, results)
+    # Generar reportes según el formato solicitado
+    report_files = []
+    
+    if output_format in ["txt", "all"]:
+        report_files.append(generar_reporte_txt(dominio, results))
+    
+    if output_format in ["json", "all"]:
+        report_files.append(generar_reporte_json(dominio, results))
+    
+    if generate_pdf or output_format in ["pdf", "all"]:
+        pdf_file = generar_reporte_pdf(dominio, results)
+        if pdf_file:
+            report_files.append(pdf_file)
 
-    print("✅ Análisis completado correctamente.")
+    print(f"✅ Análisis completado correctamente.")
+    print(f"📁 Reportes generados: {', '.join(report_files)}")
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="🔍 Domain Analyzer Pro v2.3")
     parser.add_argument("domain", nargs="?", help="Dominio a analizar (e.g. google.com)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Modo detallado")
     parser.add_argument("--pdf", action="store_true", help="Generar reporte PDF")
+    parser.add_argument("--format", choices=["txt", "json", "pdf", "all"], 
+                       default="txt", help="Formato de salida del reporte")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_arguments()
     dominio = args.domain or input("🔍 Ingrese el dominio a analizar: ").strip()
-    main(dominio, args.verbose, args.pdf)
+    main(dominio, args.verbose, args.pdf, args.format)
