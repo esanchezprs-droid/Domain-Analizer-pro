@@ -148,20 +148,32 @@ def geolocalizar_ip(ip):
         return None
 
 def obtener_ssl(dominio, port=443):
-    """Analyze SSL certificate, adapted from ssl_info.py."""
-    logger.info(f"Analyzing SSL certificate for {dominio}")
+    """Analyze SSL certificate with enhanced error handling and debugging."""
+    logger.info(f"Analyzing SSL certificate for {dominio} on port {port}")
     try:
-        # Crear un contexto SSL
+        # Crear contexto SSL con validación estricta
         context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        
-        # Conectar al servidor
-        with socket.create_connection((dominio, port), timeout=DEFAULT_TIMEOUT) as sock:
-            with context.wrap_socket(sock, server_hostname=dominio) as ssock:
-                # Obtener el certificado SSL
-                cert = ssock.getpeercert()
-                
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        logger.debug(f"Attempting strict SSL connection to {dominio}:{port}")
+
+        # Intentar conexión con validación estricta
+        try:
+            with socket.create_connection((dominio, port), timeout=DEFAULT_TIMEOUT) as sock:
+                with context.wrap_socket(sock, server_hostname=dominio) as ssock:
+                    cert = ssock.getpeercert()
+                    logger.debug(f"Certificate retrieved for {dominio} with strict validation")
+        except (ssl.SSLError, socket.timeout) as strict_error:
+            logger.warning(f"Strict SSL connection failed for {dominio}: {type(strict_error).__name__} - {str(strict_error)}")
+            # Fallback a validación relajada
+            logger.debug(f"Falling back to relaxed SSL validation for {dominio}")
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((dominio, port), timeout=DEFAULT_TIMEOUT) as sock:
+                with context.wrap_socket(sock, server_hostname=dominio) as ssock:
+                    cert = ssock.getpeercert()
+                    logger.debug(f"Certificate retrieved for {dominio} with relaxed validation")
+
         if not cert:
             logger.warning(f"No SSL certificate found for {dominio}")
             return {"Error": "No certificate found"}
@@ -175,7 +187,7 @@ def obtener_ssl(dominio, port=443):
             not_before = datetime.strptime(cert.get("notBefore", ""), "%b %d %H:%M:%S %Y %Z")
             not_after = datetime.strptime(cert.get("notAfter", ""), "%b %d %H:%M:%S %Y %Z")
         except (ValueError, KeyError) as e:
-            logger.warning(f"Error parsing SSL certificate dates: {e}")
+            logger.warning(f"Error parsing SSL certificate dates: {type(e).__name__} - {str(e)}")
             not_before = not_after = datetime.now(timezone.utc)
         
         # Hacer las fechas timezone-aware
@@ -197,7 +209,8 @@ def obtener_ssl(dominio, port=443):
                 return "N/A"
             try:
                 return ", ".join([f"{k}: {v}" for k, v in components.items()])
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error parsing certificate components: {type(e).__name__} - {str(e)}")
                 return str(components)
 
         # Construir información del certificado
@@ -217,9 +230,18 @@ def obtener_ssl(dominio, port=443):
         }
         logger.info(f"SSL certificate analysis completed for {dominio}")
         return info
+    except socket.gaierror as e:
+        logger.error(f"DNS resolution failed for {dominio}: {type(e).__name__} - {str(e)}")
+        return {"Error": f"DNS resolution failed: {str(e)}"}
+    except socket.timeout as e:
+        logger.error(f"Connection timeout for {dominio}: {type(e).__name__} - {str(e)}")
+        return {"Error": f"Connection timeout: {str(e)}"}
+    except ssl.SSLError as e:
+        logger.error(f"SSL error for {dominio}: {type(e).__name__} - {str(e)}")
+        return {"Error": f"SSL error: {str(e)}"}
     except Exception as e:
-        logger.error(f"SSL analysis failed for {dominio}: {e}")
-        return {"Error": str(e)}
+        logger.error(f"SSL analysis failed for {dominio}: {type(e).__name__} - {str(e)}")
+        return {"Error": f"{type(e).__name__}: {str(e)}"}
 
 def analizar_vulnerabilidades(dominio, verbose=False):
     """Analyze OWASP Top 10 headers and vulnerabilities."""
