@@ -147,62 +147,75 @@ def geolocalizar_ip(ip):
         logger.error(f"IP geolocation failed for {ip}: {e}")
         return None
 
-def obtener_ssl(dominio):
-    """Analyze SSL certificate."""
+def obtener_ssl(dominio, port=443):
+    """Analyze SSL certificate, adapted from ssl_info.py."""
     logger.info(f"Analyzing SSL certificate for {dominio}")
     try:
+        # Crear un contexto SSL
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         
-        with socket.create_connection((dominio, 443), timeout=DEFAULT_TIMEOUT) as sock:
+        # Conectar al servidor
+        with socket.create_connection((dominio, port), timeout=DEFAULT_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=dominio) as ssock:
+                # Obtener el certificado SSL
                 cert = ssock.getpeercert()
                 
         if not cert:
             logger.warning(f"No SSL certificate found for {dominio}")
             return {"Error": "No certificate found"}
 
-        # Parse certificate dates safely
+        # Extraer información del certificado
+        issuer = dict(x[0] for x in cert.get('issuer', []))
+        subject = dict(x[0] for x in cert.get('subject', []))
+        
+        # Parsear fechas con manejo seguro
         try:
-            not_before = datetime.strptime(cert["notBefore"], "%b %d %H:%M:%S %Y %Z")
-            not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+            not_before = datetime.strptime(cert.get("notBefore", ""), "%b %d %H:%M:%S %Y %Z")
+            not_after = datetime.strptime(cert.get("notAfter", ""), "%b %d %H:%M:%S %Y %Z")
         except (ValueError, KeyError) as e:
             logger.warning(f"Error parsing SSL certificate dates: {e}")
-            # Fallback to current time if parsing fails
             not_before = not_after = datetime.now(timezone.utc)
-
-        # Use timezone-aware datetime (CORRECCIÓN DEL WARNING)
-        ahora = datetime.now(timezone.utc)
-        # Make dates timezone-aware if they aren't
+        
+        # Hacer las fechas timezone-aware
         if not_before.tzinfo is None:
             not_before = not_before.replace(tzinfo=timezone.utc)
         if not_after.tzinfo is None:
             not_after = not_after.replace(tzinfo=timezone.utc)
-            
+        
+        # Calcular días restantes y estado
+        ahora = datetime.now(timezone.utc)
         dias_restantes = (not_after - ahora).days
         estado = "✅ Válido" if ahora < not_after else "❌ Expirado"
         if 0 < dias_restantes < 30:
             estado += " ⚠️ Expira pronto"
 
-        # Parse subject and issuer safely
+        # Formatear issuer y subject
         def parse_name_components(components):
             if not components:
                 return "N/A"
             try:
-                return ", ".join([f"{k}: {v}" for item in components for k, v in item])
+                return ", ".join([f"{k}: {v}" for k, v in components.items()])
             except Exception:
                 return str(components)
 
+        # Construir información del certificado
         info = {
-            "Sujeto": parse_name_components(cert.get("subject", [])),
-            "Emisor": parse_name_components(cert.get("issuer", [])),
+            "Sujeto": parse_name_components(subject),
+            "Emisor": parse_name_components(issuer),
             "Válido Desde": not_before.strftime("%Y-%m-%d"),
             "Válido Hasta": not_after.strftime("%Y-%m-%d"),
             "Días Restantes": dias_restantes,
             "Estado": estado,
+            "Versión": str(cert.get("version", "N/A")),
+            "Número de Serie": cert.get("serialNumber", "N/A"),
+            "Algoritmo de Firma": cert.get("signatureAlgorithm", "Not available"),
+            "Algoritmo de Clave": cert.get("keyAlgorithm", "Not available"),
+            "Tamaño de Clave": str(cert.get("keySize", "Not available")),
             "Nombres Alternativos": ", ".join([name[1] for name in cert.get("subjectAltName", [])]) if cert.get("subjectAltName") else "N/A",
         }
+        logger.info(f"SSL certificate analysis completed for {dominio}")
         return info
     except Exception as e:
         logger.error(f"SSL analysis failed for {dominio}: {e}")
