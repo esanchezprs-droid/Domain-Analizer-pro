@@ -20,10 +20,14 @@ import json
 import urllib3
 from datetime import datetime, timezone
 from urllib.parse import quote, urljoin
-
 import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
+from importlib import import_module
+from functools import lru_cache
+import idna
+from typing import Optional, Dict, Any
+import whois
 
 # Disable SSL warnings for scanning HTTPS without verify=True
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,10 +50,235 @@ COMMON_SUBDOMAINS = [
     "ftp", "admin", "secure", "vpn", "web", "app", "portal", "login"
 ]
 
+# Precompiled regex for domain validation (from whois_lookup.py)
+DOMAIN_REGEX = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+
+# Cache settings (from whois_lookup.py)
+TLD_CACHE_FILE = "tld_cache.json"
+WHOIS_CACHE_FILE = "whois_cache.json"
+CACHE_REFRESH_DAYS = 7
+WHOIS_TIMEOUT = 10  # seconds
+
+# TLD cache (from whois_lookup.py)
+_tld_cache = None
+
+# WHOIS cache (from whois_lookup.py)
+_whois_cache = {}
+
+def load_tld_cache() -> set:
+    """Load TLD cache from file if valid, otherwise fetch from IANA."""
+    global _tld_cache
+    if _tld_cache is not None:
+        return _tld_cache
+    
+    if not os.path.exists(TLD_CACHE_FILE):
+        _tld_cache = fetch_tld_list()
+        return _tld_cache
+    
+    try:
+        with open(TLD_CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+            last_updated = datetime.fromisoformat(cache['last_updated'])
+            if datetime.now() < last_updated + timedelta(days=CACHE_REFRESH_DAYS):
+                _tld_cache = set(cache['tlds'])
+                return _tld_cache
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"Failed to load TLD cache: {str(e)}. Fetching new TLD list.")
+    
+    _tld_cache = fetch_tld_list()
+    return _tld_cache
+
+def fetch_tld_list() -> set:
+    """Fetch IANA TLD list and save to cache."""
+    try:
+        response = requests.get("https://data.iana.org/TLD/tlds-alpha-by-domain.txt", timeout=5)
+        response.raise_for_status()
+        tld_list = {line.strip().lower() for line in response.text.splitlines() if line and not line.startswith('#')}
+        
+        cache_data = {
+            'last_updated': datetime.now().isoformat(),
+            'tlds': list(tld_list)
+        }
+        with open(TLD_CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f)
+        return tld_list
+    except requests.RequestException as e:
+        logger.warning(f"Could not fetch TLD list: {str(e)}. Skipping TLD validation.")
+        return set()
+
+@lru_cache(maxsize=500)
+def validate_domain(domain: str, validate_tld: bool = True) -> Optional[str]:
+    """Validate a domain name efficiently and convert IDNs to Punycode."""
+    if not isinstance(domain, str):
+        raise ValueError("Domain must be a string")
+    
+    domain = domain.strip().lower()
+    if len(domain) > 255:
+        raise ValueError("Domain too long (max 255 characters)")
+    if len(domain) < 3:
+        raise ValueError("Domain is too short or empty")
+    
+    punycode_domain = domain
+    if any(ord(c) > 127 for c in domain):
+        try:
+            punycode_domain = idna.encode(domain).decode('ascii')
+        except idna.IDNAError as e:
+            raise ValueError(f"Invalid IDN domain: {str(e)}")
+    
+    if not DOMAIN_REGEX.match(punycode_domain):
+        raise ValueError(f"Invalid domain format: {domain}")
+    
+    if validate_tld:
+        load_tld_cache()
+        if _tld_cache and punycode_domain.split('.')[-1] not in _tld_cache:
+            raise ValueError(f"Invalid TLD: {punycode_domain.split('.')[-1]}")
+    
+    return punycode_domain
+
+def load_whois_cache() -> Dict[str, dict]:
+    """Load WHOIS cache from file, reformatting legacy entries if needed."""
+    if not os.path.exists(WHOIS_CACHE_FILE):
+        return {}
+    
+    try:
+        with open(WHOIS_CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+            now = datetime.now().timestamp()
+            reformatted_cache = {}
+            for domain, data in cache.items():
+                if not isinstance(data, dict) or 'timestamp' not in data or 'data' not in data:
+                    logger.warning(f"Invalid cache entry for {domain}, skipping.")
+                    continue
+                if data['timestamp'] + (CACHE_REFRESH_DAYS * 86400) <= now:
+                    logger.info(f"Cache entry for {domain} expired, skipping.")
+                    continue
+                reformatted_data = {}
+                for key in ['domain_name', 'registrar', 'creation_date', 'expiration_date', 'name_servers']:
+                    if key in data['data']:
+                        try:
+                            reformatted_data[key] = format_whois_value(data['data'][key], key)
+                        except Exception as e:
+                            logger.warning(f"Failed to reformat {key} for {domain}: {str(e)}")
+                            reformatted_data[key] = 'N/A'
+                reformatted_cache[domain] = {
+                    'data': reformatted_data,
+                    'timestamp': data['timestamp']
+                }
+            save_whois_cache(reformatted_cache)
+            return reformatted_cache
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.error(f"Failed to load WHOIS cache: {str(e)}. Starting with empty cache.")
+        return {}
+
+def save_whois_cache(cache: Dict[str, dict]) -> None:
+    """Save WHOIS cache to file."""
+    try:
+        with open(WHOIS_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, default=str)
+    except Exception as e:
+        logger.error(f"Could not save WHOIS cache: {str(e)}")
+
+def format_whois_value(value: Any, key: str) -> str:
+    """Format WHOIS field values, handling lists and other types efficiently."""
+    if value is None:
+        return 'N/A'
+    
+    if isinstance(value, list):
+        if not value:
+            return 'N/A'
+        if key in ['creation_date', 'expiration_date']:
+            for item in value:
+                if item is not None:
+                    return item.replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+            return 'N/A'
+        else:
+            return ', '.join(str(item) for item in value if item is not None)
+    
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+    
+    return str(value)
+
+def obtener_whois(dominio: str) -> Optional[Dict[str, str]]:
+    """Perform a WHOIS lookup with caching, adapted from whois_lookup.py."""
+    global _whois_cache
+    if not _whois_cache:
+        _whois_cache = load_whois_cache()
+    
+    try:
+        # Validate domain
+        validated_domain = validate_domain(dominio)
+        logger.info(f"Validated domain: {validated_domain}")
+    except ValueError as e:
+        logger.error(f"Domain validation failed for {dominio}: {str(e)}")
+        return None
+
+    # Check cache
+    if validated_domain in _whois_cache:
+        logger.info(f"Returning cached WHOIS data for {validated_domain}")
+        data = _whois_cache[validated_domain]['data']
+        return {
+            "Dominio": data.get("domain_name", "N/A"),
+            "Estado": "N/A",  # Not explicitly in whois_lookup.py, default to N/A
+            "Creado": data.get("creation_date", "N/A"),
+            "Expira": data.get("expiration_date", "N/A"),
+            "Registrar": data.get("registrar", "N/A"),
+            "Servidores DNS": data.get("name_servers", "N/A"),
+            "Registrante": "Privado",  # Not provided by whois_lookup.py
+            "Email": "Privado",  # Not provided by whois_lookup.py
+            "País": "N/A"  # Not provided by whois_lookup.py
+        }
+    
+    try:
+        if not check_library("whois"):
+            raise ImportError("python-whois library is not installed. Install it with 'pip install python-whois'")
+        
+        w = whois.whois(validated_domain, timeout=WHOIS_TIMEOUT)
+        if not w:
+            logger.warning(f"No WHOIS data found for {validated_domain}")
+            return None
+        
+        essential_data = {}
+        for key in ['domain_name', 'registrar', 'creation_date', 'expiration_date', 'name_servers']:
+            if key in w:
+                essential_data[key] = format_whois_value(w[key], key)
+        
+        _whois_cache[validated_domain] = {
+            'data': essential_data,
+            'timestamp': datetime.now().timestamp()
+        }
+        save_whois_cache(_whois_cache)
+        
+        return {
+            "Dominio": essential_data.get("domain_name", "N/A"),
+            "Estado": "N/A",  # Not explicitly in whois_lookup.py
+            "Creado": essential_data.get("creation_date", "N/A"),
+            "Expira": essential_data.get("expiration_date", "N/A"),
+            "Registrar": essential_data.get("registrar", "N/A"),
+            "Servidores DNS": essential_data.get("name_servers", "N/A"),
+            "Registrante": "Privado",  # Not provided by whois_lookup.py
+            "Email": "Privado",  # Not provided by whois_lookup.py
+            "País": "N/A"  # Not provided by whois_lookup.py
+        }
+    except Exception as e:
+        logger.error(f"WHOIS query failed for {validated_domain}: {str(e)}")
+        return None
+
+def check_library(library_name: str) -> bool:
+    """Check if a library is installed."""
+    try:
+        import_module(library_name)
+        return True
+    except ImportError:
+        return False
+
 def validar_dominio(dominio):
     """Validate that the input is a valid domain."""
-    patron = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$'
-    return bool(re.match(patron, dominio)) and len(dominio) <= 253
+    try:
+        validate_domain(dominio)
+        return True
+    except ValueError:
+        return False
 
 def obtener_ip_socket(dominio):
     """Resolve domain to IP addresses using socket."""
@@ -74,90 +303,15 @@ def analizar_subdominios(dominio):
         logger.warning(f"No active subdomains found for {dominio}")
     return subdomains_data
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def obtener_whois_api(dominio):
-    """Fetch WHOIS data via free API."""
-    try:
-        api_url = os.getenv("WHOIS_API_URL", f"https://whoisjson.com/v1/{quote(dominio)}")
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; DomainAnalyzer)"}
-        response = requests.get(api_url, headers=headers, timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"WHOIS API request failed for {dominio}: {e}")
-        return None
-
-def parsear_whois_api(data):
-    """Parse WHOIS API response into structured data."""
-    if not data or "domain" not in data:
-        logger.warning("No valid WHOIS data received")
-        return None
-    
-    # Manejar diferentes estructuras de respuesta de WHOIS
-    registrar_info = data.get("registrar", {})
-    if isinstance(registrar_info, str):
-        registrar_name = registrar_info
-    else:
-        registrar_name = registrar_info.get("name", "N/A")
-    
-    registrant_info = data.get("registrant", {})
-    if isinstance(registrant_info, str):
-        registrant_name = registrant_info
-    else:
-        registrant_name = registrant_info.get("name", "Privado")
-    
-    info = {
-        "Dominio": data.get("domain", "N/A"),
-        "Estado": data.get("status", "N/A"),
-        "Creado": data.get("created_at", data.get("creation_date", "N/A")),
-        "Expira": data.get("expires_at", data.get("expiration_date", "N/A")),
-        "Registrar": registrar_name,
-        "Servidores DNS": ", ".join(data.get("nameservers", [])),
-        "Registrante": registrant_name,
-        "Email": registrant_info.get("email", "Privado") if isinstance(registrant_info, dict) else "Privado",
-        "País": registrant_info.get("country", "N/A") if isinstance(registrant_info, dict) else "N/A",
-    }
-    logger.info(f"Parsed WHOIS data: {info}")
-    return info
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def geolocalizar_ip(ip):
-    """Geolocate an IP address."""
-    try:
-        url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,lat,lon,isp,org"
-        response = requests.get(url, timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("status") == "success":
-            geo_data = {
-                "IP": ip,
-                "País": data.get("country", "N/A"),
-                "Código": data.get("countryCode", "N/A"),
-                "Región": data.get("regionName", "N/A"),
-                "Ciudad": data.get("city", "N/A"),
-                "Latitud": str(data.get("lat", "N/A")),
-                "Longitud": str(data.get("lon", "N/A")),
-                "ISP": data.get("isp", "N/A"),
-                "Organización": data.get("org", "N/A"),
-            }
-            logger.info(f"Geolocation data for {ip}: {geo_data}")
-            return geo_data
-        return None
-    except requests.RequestException as e:
-        logger.error(f"IP geolocation failed for {ip}: {e}")
-        return None
-
 def obtener_ssl(dominio, port=443):
     """Analyze SSL certificate with enhanced error handling and debugging."""
     logger.info(f"Analyzing SSL certificate for {dominio} on port {port}")
     try:
-        # Crear contexto SSL con validación estricta
         context = ssl.create_default_context()
         context.check_hostname = True
         context.verify_mode = ssl.CERT_REQUIRED
         logger.debug(f"Attempting strict SSL connection to {dominio}:{port}")
 
-        # Intentar conexión con validación estricta
         try:
             with socket.create_connection((dominio, port), timeout=DEFAULT_TIMEOUT) as sock:
                 with context.wrap_socket(sock, server_hostname=dominio) as ssock:
@@ -165,7 +319,6 @@ def obtener_ssl(dominio, port=443):
                     logger.debug(f"Certificate retrieved for {dominio} with strict validation")
         except (ssl.SSLError, socket.timeout) as strict_error:
             logger.warning(f"Strict SSL connection failed for {dominio}: {type(strict_error).__name__} - {str(strict_error)}")
-            # Fallback a validación relajada
             logger.debug(f"Falling back to relaxed SSL validation for {dominio}")
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
@@ -178,11 +331,9 @@ def obtener_ssl(dominio, port=443):
             logger.warning(f"No SSL certificate found for {dominio}")
             return {"Error": "No certificate found"}
 
-        # Extraer información del certificado
         issuer = dict(x[0] for x in cert.get('issuer', []))
         subject = dict(x[0] for x in cert.get('subject', []))
         
-        # Parsear fechas con manejo seguro
         try:
             not_before = datetime.strptime(cert.get("notBefore", ""), "%b %d %H:%M:%S %Y %Z")
             not_after = datetime.strptime(cert.get("notAfter", ""), "%b %d %H:%M:%S %Y %Z")
@@ -190,20 +341,17 @@ def obtener_ssl(dominio, port=443):
             logger.warning(f"Error parsing SSL certificate dates: {type(e).__name__} - {str(e)}")
             not_before = not_after = datetime.now(timezone.utc)
         
-        # Hacer las fechas timezone-aware
         if not_before.tzinfo is None:
             not_before = not_before.replace(tzinfo=timezone.utc)
         if not_after.tzinfo is None:
             not_after = not_after.replace(tzinfo=timezone.utc)
         
-        # Calcular días restantes y estado
         ahora = datetime.now(timezone.utc)
         dias_restantes = (not_after - ahora).days
         estado = "✅ Válido" if ahora < not_after else "❌ Expirado"
         if 0 < dias_restantes < 30:
             estado += " ⚠️ Expira pronto"
 
-        # Formatear issuer y subject
         def parse_name_components(components):
             if not components:
                 return "N/A"
@@ -213,7 +361,6 @@ def obtener_ssl(dominio, port=443):
                 logger.warning(f"Error parsing certificate components: {type(e).__name__} - {str(e)}")
                 return str(components)
 
-        # Construir información del certificado
         info = {
             "Sujeto": parse_name_components(subject),
             "Emisor": parse_name_components(issuer),
@@ -254,7 +401,6 @@ def analizar_vulnerabilidades(dominio, verbose=False):
         response = session.get(base_url, timeout=DEFAULT_TIMEOUT, verify=False)
         headers = response.headers
 
-        # Security headers
         if "Strict-Transport-Security" not in headers:
             vulnerabilidades.append("❌ HSTS ausente - MITM posible")
             puntuacion -= 15
@@ -271,7 +417,6 @@ def analizar_vulnerabilidades(dominio, verbose=False):
             vulnerabilidades.append("⚠️ Referrer-Policy ausente")
             puntuacion -= 5
 
-        # HTTP Methods check
         try:
             resp = session.options(base_url, timeout=DEFAULT_TIMEOUT)
             allow = resp.headers.get("Allow", "")
@@ -284,18 +429,15 @@ def analizar_vulnerabilidades(dominio, verbose=False):
         except requests.RequestException:
             pass
 
-        # CORS
         if headers.get("Access-Control-Allow-Origin") == "*":
             vulnerabilidades.append("🚨 CORS abierto (*)")
             puntuacion -= 15
 
-        # Cookies
         cookies_secure = all(hasattr(c, 'secure') and c.secure for c in response.cookies)
         if response.cookies and not cookies_secure:
             vulnerabilidades.append("❌ Cookies sin Secure flag")
             puntuacion -= 10
 
-        # Server info leak
         if "Server" in headers and len(headers["Server"]) > 5:
             vulnerabilidades.append(f"ℹ️ Server expuesto: {headers['Server']}")
             puntuacion -= 3
@@ -327,7 +469,6 @@ def generar_reporte_txt(dominio, results):
         f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 60 + "\n\n")
         
-        # Información DNS
         f.write("1. INFORMACIÓN DNS\n")
         f.write("-" * 40 + "\n")
         if results["dns"]["ips"]:
@@ -336,7 +477,6 @@ def generar_reporte_txt(dominio, results):
             f.write("❌ No se pudieron resolver las IPs\n")
         f.write("\n")
         
-        # Subdominios
         f.write("2. SUBDOMINIOS ANALIZADOS\n")
         f.write("-" * 40 + "\n")
         for sub in results["subdomains"]:
@@ -346,7 +486,6 @@ def generar_reporte_txt(dominio, results):
             f.write("\n")
         f.write("\n")
         
-        # WHOIS
         f.write("3. INFORMACIÓN WHOIS\n")
         f.write("-" * 40 + "\n")
         if results["whois"]:
@@ -356,7 +495,6 @@ def generar_reporte_txt(dominio, results):
             f.write("❌ No se pudo obtener información WHOIS\n")
         f.write("\n")
         
-        # SSL
         f.write("4. CERTIFICADO SSL\n")
         f.write("-" * 40 + "\n")
         if results["ssl"] and "Error" not in results["ssl"]:
@@ -366,7 +504,6 @@ def generar_reporte_txt(dominio, results):
             f.write("❌ No se pudo analizar el certificado SSL\n")
         f.write("\n")
         
-        # Geolocalización
         f.write("5. GEOLOCALIZACIÓN\n")
         f.write("-" * 40 + "\n")
         if results["geolocation"]:
@@ -378,7 +515,6 @@ def generar_reporte_txt(dominio, results):
             f.write("❌ No se pudo obtener geolocalización\n")
         f.write("\n")
         
-        # Vulnerabilidades
         f.write("6. ANÁLISIS DE VULNERABILIDADES\n")
         f.write("-" * 40 + "\n")
         vuln = results["vulnerabilities"]
@@ -421,7 +557,6 @@ def generar_reporte_pdf(dominio, results):
 
     logger.info(f"Generating PDF for {dominio}")
     
-    # Construir contenido del reporte
     tex_content = rf"""
 \documentclass[a4paper,12pt]{{article}}
 \usepackage[utf8]{{inputenc}}
@@ -447,7 +582,6 @@ IPs Resueltas: {", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "
 \textbf{{Subdominio}} & \textbf{{Estado}} & \textbf{{IPs}} \\
 \midrule
 """
-    # Agregar subdominios
     for sub in results["subdomains"]:
         tex_content += f"{sub['subdomain']} & {sub['status']} & {', '.join(sub['ips']) if sub['ips'] else 'N/A'} \\\\ \n"
 
@@ -488,17 +622,15 @@ def main(dominio, verbose=False, generate_pdf=False, output_format="txt"):
 
     print(f"🔍 Análisis completo del dominio: {dominio}")
     
-    # Realizar análisis
     results = {
         "dns": {"ips": obtener_ip_socket(dominio)},
         "subdomains": analizar_subdominios(dominio),
-        "whois": parsear_whois_api(obtener_whois_api(dominio)),
+        "whois": obtener_whois(dominio),
         "ssl": obtener_ssl(dominio),
         "vulnerabilities": analizar_vulnerabilidades(dominio, verbose),
         "geolocation": {}
     }
 
-    # Geolocalización para todas las IPs encontradas
     all_ips = set()
     if results["dns"]["ips"]:
         all_ips.update(results["dns"]["ips"])
@@ -512,7 +644,6 @@ def main(dominio, verbose=False, generate_pdf=False, output_format="txt"):
         if geo_data:
             results["geolocation"][ip] = geo_data
 
-    # Generar reportes según el formato solicitado
     report_files = []
     
     if output_format in ["txt", "all"]:
