@@ -14,6 +14,8 @@ pip install .
 
 pip install python-whois
 
+sudo apt-get install texlive-full
+
 pip install certify
 
 pip install requests
@@ -25,3 +27,7 @@ pip install -r requirements.txt
 pip install --upgrade charset-normalizer==3.3.2
 
 pip install --upgrade chardet==5.2.0
+
+#Clear Cache (Optional): To force a fresh WHOIS query:
+bash
+rm whois_cache.json
