@@ -18,7 +18,7 @@ import subprocess
 import shutil
 import json
 import urllib3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urljoin
 import requests
 from bs4 import BeautifulSoup
@@ -271,6 +271,33 @@ def check_library(library_name: str) -> bool:
         return True
     except ImportError:
         return False
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def geolocalizar_ip(ip):
+    """Geolocate an IP address."""
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,lat,lon,isp,org"
+        response = requests.get(url, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "success":
+            geo_data = {
+                "IP": ip,
+                "País": data.get("country", "N/A"),
+                "Código": data.get("countryCode", "N/A"),
+                "Región": data.get("regionName", "N/A"),
+                "Ciudad": data.get("city", "N/A"),
+                "Latitud": str(data.get("lat", "N/A")),
+                "Longitud": str(data.get("lon", "N/A")),
+                "ISP": data.get("isp", "N/A"),
+                "Organización": data.get("org", "N/A"),
+            }
+            logger.info(f"Geolocation data for {ip}: {geo_data}")
+            return geo_data
+        return None
+    except requests.RequestException as e:
+        logger.error(f"IP geolocation failed for {ip}: {e}")
+        return None
 
 def validar_dominio(dominio):
     """Validate that the input is a valid domain."""
