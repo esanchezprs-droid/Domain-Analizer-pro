@@ -6,6 +6,9 @@ source venv/bin/activate
 
 pip freeze > requirements.txt
 
+
+pip install tabulate
+
 pip install tenacity
 
 git clone https://github.com/urllib3/urllib3.git
@@ -31,3 +34,6 @@ pip install --upgrade chardet==5.2.0
 #Clear Cache (Optional): To force a fresh WHOIS query:
 bash
 rm whois_cache.json
+
+para generar todos los reportes
+python3 domain_analyzer_pro.py google.com --verbose --format all
