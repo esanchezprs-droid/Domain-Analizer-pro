@@ -35,6 +35,7 @@ try:
     TABULATE_AVAILABLE = True
 except ImportError:
     TABULATE_AVAILABLE = False
+    print("⚠️ 'tabulate' not installed. Falling back to manual table formatting. Install with: pip install tabulate")
 
 # Disable SSL warnings for scanning HTTPS without verify=True
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -260,7 +261,7 @@ def obtener_whois(dominio: str) -> Optional[Dict[str, str]]:
             "Creado": essential_data.get("creation_date", "N/A"),
             "Expira": essential_data.get("expiration_date", "N/A"),
             "Registrar": essential_data.get("registrar", "N/A"),
-            "Servidores DNS": essential_data.get("name_servers", "N/A"),
+            "Servidores DNS": data.get("name_servers", "N/A"),
             "Registrante": "Privado",
             "Email": "Privado",
             "País": "N/A"
@@ -489,63 +490,76 @@ def analizar_vulnerabilidades(dominio, verbose=False):
         ] if puntuacion < 80 else []
     }
 
+def truncate_text(text, max_length):
+    """Truncate text to fit within column width, adding ellipsis if needed."""
+    if len(text) > max_length:
+        return text[:max_length - 3] + "..."
+    return text
+
 def generar_reporte_txt(dominio, results):
-    """Generate a comprehensive text report in a single table."""
+    """Generate a comprehensive text report in a single table with section explanations."""
     filename = f"report_{dominio.replace('.', '_')}.txt"
     
-    # Prepare table data
+    # Prepare table data with section explanations
     table_data = []
     
     # Header
     table_data.append(["Categoría", "Descripción", "Valor"])
     table_data.append(["-"*20, "-"*30, "-"*50])
     
+    # Section explanations
+    table_data.append(["DNS", "Información", "Resolución de IPs asociadas al dominio principal."])
     # DNS
-    table_data.append(["DNS", "IP(s) Resuelta(s)", ", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "No se resolvieron IPs"])
+    table_data.append(["DNS", "IP(s) Resuelta(s)", truncate_text(", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "No se resolvieron IPs", 50)])
     
     # Subdomains
+    table_data.append(["Subdominios", "Información", "Estado de subdominios comunes y sus IPs asociadas."])
     for sub in results["subdomains"]:
-        table_data.append(["Subdominios", sub["subdomain"], f"{sub['status']} {'→ ' + ', '.join(sub['ips']) if sub['ips'] else ''}"])
+        table_data.append(["Subdominios", sub["subdomain"], truncate_text(f"{sub['status']} {'→ ' + ', '.join(sub['ips']) if sub['ips'] else ''}", 50)])
     
     # WHOIS
+    table_data.append(["WHOIS", "Información", "Detalles de registro del dominio (propietario, fechas, etc.)."])
     if results["whois"]:
         for key, value in results["whois"].items():
-            table_data.append(["WHOIS", key, value])
+            table_data.append(["WHOIS", key, truncate_text(value, 50)])
     else:
         table_data.append(["WHOIS", "Estado", "No se pudo obtener información WHOIS"])
     
     # SSL
+    table_data.append(["SSL", "Información", "Análisis del certificado SSL (validez, emisor, etc.)."])
     if results["ssl"] and "Error" not in results["ssl"]:
         for key, value in results["ssl"].items():
-            table_data.append(["SSL", key, str(value)])
+            table_data.append(["SSL", key, truncate_text(str(value), 50)])
     else:
-        table_data.append(["SSL", "Estado", results["ssl"].get("Error", "No se pudo analizar el certificado SSL")])
+        table_data.append(["SSL", "Estado", truncate_text(results["ssl"].get("Error", "No se pudo analizar el certificado SSL"), 50)])
     
     # Geolocation
+    table_data.append(["Geolocalización", "Información", "Ubicación geográfica de las IPs asociadas al dominio."])
     if results["geolocation"]:
         for ip, geo_data in results["geolocation"].items():
             if geo_data:
                 for key, value in geo_data.items():
-                    table_data.append(["Geolocalización", f"{key} ({ip})", value])
+                    table_data.append(["Geolocalización", f"{key} ({ip})", truncate_text(value, 50)])
     else:
         table_data.append(["Geolocalización", "Estado", "No se pudo obtener geolocalización"])
     
     # Vulnerabilities
+    table_data.append(["Vulnerabilidades", "Información", "Análisis de seguridad basado en OWASP Top 10."])
     vuln = results["vulnerabilities"]
     table_data.append(["Vulnerabilidades", "Puntuación de Seguridad", f"{vuln['puntuacion']}/100"])
     if vuln["vulnerabilidades"]:
         for v in vuln["vulnerabilidades"]:
-            table_data.append(["Vulnerabilidades", "Problema Detectado", v])
+            table_data.append(["Vulnerabilidades", "Problema Detectado", truncate_text(v, 50)])
     else:
         table_data.append(["Vulnerabilidades", "Problema Detectado", "No se encontraron vulnerabilidades críticas"])
     if vuln["recomendaciones"]:
         for r in vuln["recomendaciones"]:
-            table_data.append(["Vulnerabilidades", "Recomendación", r])
+            table_data.append(["Vulnerabilidades", "Recomendación", truncate_text(r, 50)])
     
     # Write report
     with open(filename, "w", encoding="utf-8") as f:
         f.write("=" * 100 + "\n")
-        f.write(f"Análisis Completo del Dominio: {dominio}\n")
+        f.write(f"Reporte de Análisis de Dominio: {dominio}\n")
         f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 100 + "\n\n")
         f.write("RESUMEN DEL ANÁLISIS\n")
@@ -554,26 +568,29 @@ def generar_reporte_txt(dominio, results):
         if TABULATE_AVAILABLE:
             f.write(tabulate(table_data, headers="firstrow", tablefmt="grid"))
         else:
-            # Manual ASCII table formatting
+            # Improved manual ASCII table formatting
             col_widths = [20, 30, 50]
             f.write(f"{'Categoría':<{col_widths[0]}} {'Descripción':<{col_widths[1]}} {'Valor':<{col_widths[2]}}\n")
-            f.write("-" * sum(col_widths) + "\n")
+            f.write("=" * sum(col_widths) + "\n")
             for row in table_data[2:]:  # Skip header and separator
-                f.write(f"{row[0]:<{col_widths[0]}} {row[1]:<{col_widths[1]}} {row[2]:<{col_widths[2]}}\n")
+                f.write(f"{row[0]:<{col_widths[0]}} {row[1]:<{col_widths[1]}} {truncate_text(row[2], col_widths[2]):<{col_widths[2]}}\n")
+            f.write("=" * sum(col_widths) + "\n")
         f.write("\n")
     
     print(f"✅ Reporte de texto generado: {filename}")
     return filename
 
 def generar_reporte_json(dominio, results):
-    """Generate a JSON report with table-like structure."""
+    """Generate a JSON report with table-like structure and section explanations."""
     filename = f"report_{dominio.replace('.', '_')}.json"
     
     # Prepare table-like data
     analysis_results = [
+        {"category": "DNS", "description": "Información", "value": "Resolución de IPs asociadas al dominio principal."},
         {"category": "DNS", "description": "IP(s) Resuelta(s)", "value": ", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "No se resolvieron IPs"}
     ]
     
+    analysis_results.append({"category": "Subdominios", "description": "Información", "value": "Estado de subdominios comunes y sus IPs asociadas."})
     for sub in results["subdomains"]:
         analysis_results.append({
             "category": "Subdominios",
@@ -581,18 +598,21 @@ def generar_reporte_json(dominio, results):
             "value": f"{sub['status']} {'→ ' + ', '.join(sub['ips']) if sub['ips'] else ''}"
         })
     
+    analysis_results.append({"category": "WHOIS", "description": "Información", "value": "Detalles de registro del dominio (propietario, fechas, etc.)."})
     if results["whois"]:
         for key, value in results["whois"].items():
             analysis_results.append({"category": "WHOIS", "description": key, "value": value})
     else:
         analysis_results.append({"category": "WHOIS", "description": "Estado", "value": "No se pudo obtener información WHOIS"})
     
+    analysis_results.append({"category": "SSL", "description": "Información", "value": "Análisis del certificado SSL (validez, emisor, etc.)."})
     if results["ssl"] and "Error" not in results["ssl"]:
         for key, value in results["ssl"].items():
             analysis_results.append({"category": "SSL", "description": key, "value": str(value)})
     else:
         analysis_results.append({"category": "SSL", "description": "Estado", "value": results["ssl"].get("Error", "No se pudo analizar el certificado SSL")})
     
+    analysis_results.append({"category": "Geolocalización", "description": "Información", "value": "Ubicación geográfica de las IPs asociadas al dominio."})
     if results["geolocation"]:
         for ip, geo_data in results["geolocation"].items():
             if geo_data:
@@ -601,6 +621,7 @@ def generar_reporte_json(dominio, results):
     else:
         analysis_results.append({"category": "Geolocalización", "description": "Estado", "value": "No se pudo obtener geolocalización"})
     
+    analysis_results.append({"category": "Vulnerabilidades", "description": "Información", "value": "Análisis de seguridad basado en OWASP Top 10."})
     vuln = results["vulnerabilities"]
     analysis_results.append({"category": "Vulnerabilidades", "description": "Puntuación de Seguridad", "value": f"{vuln['puntuacion']}/100"})
     if vuln["vulnerabilidades"]:
@@ -615,7 +636,7 @@ def generar_reporte_json(dominio, results):
     # Write JSON report
     with open(filename, "w", encoding="utf-8") as f:
         json.dump({
-            "dominio": dominio,
+            "reporte": f"Análisis de Dominio: {dominio}",
             "fecha_analisis": datetime.now().isoformat(),
             "analysis_results": analysis_results
         }, f, indent=2, ensure_ascii=False)
@@ -624,7 +645,7 @@ def generar_reporte_json(dominio, results):
     return filename
 
 def generar_reporte_pdf(dominio, results):
-    """Generate a PDF report with a single table using LaTeX."""
+    """Generate a PDF report with a single table using LaTeX and section explanations."""
     if not shutil.which("pdflatex"):
         print("⚠️ pdflatex no instalado. Solo se generará el archivo .tex")
         return None
@@ -639,7 +660,7 @@ def generar_reporte_pdf(dominio, results):
             '\\': r'\textbackslash{}'
         }
         for old, new in replacements.items():
-            text = text.replace(old, new)
+            text = str(text).replace(old, new)
         return text
 
     # Prepare table data
@@ -648,23 +669,28 @@ def generar_reporte_pdf(dominio, results):
     table_rows.append(r"\hline")
     table_rows.append(r"Categoría & Descripción & Valor \\ \hline")
     
+    table_rows.append(r"DNS & Información & Resolución de IPs asociadas al dominio principal. \\")
     table_rows.append(r"DNS & IP(s) Resuelta(s) & " + escape_latex(", ".join(results["dns"]["ips"]) if results["dns"]["ips"] else "No se resolvieron IPs") + r" \\")
     
+    table_rows.append(r"Subdominios & Información & Estado de subdominios comunes y sus IPs asociadas. \\")
     for sub in results["subdomains"]:
         table_rows.append(r"Subdominios & " + escape_latex(sub["subdomain"]) + " & " + escape_latex(f"{sub['status']} {'→ ' + ', '.join(sub['ips']) if sub['ips'] else ''}") + r" \\")
     
+    table_rows.append(r"WHOIS & Información & Detalles de registro del dominio (propietario, fechas, etc.). \\")
     if results["whois"]:
         for key, value in results["whois"].items():
             table_rows.append(r"WHOIS & " + escape_latex(key) + " & " + escape_latex(value) + r" \\")
     else:
         table_rows.append(r"WHOIS & Estado & No se pudo obtener información WHOIS \\")
     
+    table_rows.append(r"SSL & Información & Análisis del certificado SSL (validez, emisor, etc.). \\")
     if results["ssl"] and "Error" not in results["ssl"]:
         for key, value in results["ssl"].items():
             table_rows.append(r"SSL & " + escape_latex(key) + " & " + escape_latex(str(value)) + r" \\")
     else:
         table_rows.append(r"SSL & Estado & " + escape_latex(results["ssl"].get("Error", "No se pudo analizar el certificado SSL")) + r" \\")
     
+    table_rows.append(r"Geolocalización & Información & Ubicación geográfica de las IPs asociadas al dominio. \\")
     if results["geolocation"]:
         for ip, geo_data in results["geolocation"].items():
             if geo_data:
@@ -673,6 +699,7 @@ def generar_reporte_pdf(dominio, results):
     else:
         table_rows.append(r"Geolocalización & Estado & No se pudo obtener geolocalización \\")
     
+    table_rows.append(r"Vulnerabilidades & Información & Análisis de seguridad basado en OWASP Top 10. \\")
     vuln = results["vulnerabilities"]
     table_rows.append(r"Vulnerabilidades & Puntuación de Seguridad & " + escape_latex(f"{vuln['puntuacion']}/100") + r" \\")
     if vuln["vulnerabilidades"]:
@@ -696,7 +723,7 @@ def generar_reporte_pdf(dominio, results):
 \usepackage{{booktabs,longtable,xcolor,hyperref}}
 \usepackage{{lmodern}}
 \begin{{document}}
-\title{{Análisis de Dominio: {escape_latex(dominio)}}}
+\title{{Reporte de Análisis de Dominio: {escape_latex(dominio)}}}
 \author{{Domain Analyzer Pro v2.3}}
 \date{{Generado el {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}}
 \maketitle
